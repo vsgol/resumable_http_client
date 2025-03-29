@@ -84,7 +84,8 @@ fun downloadRange(url: URL, start: Int, declaredSize: Int?): ByteArray {
             // warning handled in caller
         } else {
             val newTotal = start + bytes.size
-            println("Received ${bytes.size} bytes (${declaredSize?.let { "$newTotal/$it" } ?: "$newTotal/?"})")
+            println("Received ${bytes.size} bytes (${declaredSize?.let { "$newTotal/$it" } ?: "$newTotal/?"})" +
+                    declaredSize?.let { " (${100 * newTotal / it}%)" }.orEmpty())
         }
         bytes
     } catch (e: IOException) {
