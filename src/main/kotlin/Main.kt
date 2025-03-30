@@ -8,9 +8,10 @@ import java.security.MessageDigest
 fun main() {
     val url = URI.create("http://127.0.0.1:8080/").toURL()
     try {
-        val fileBytes = downloadFullFile(url)
+        val (fileBytes, complete) = downloadFullFile(url)
         println("Downloaded ${fileBytes.size} bytes.")
         println("SHA-256: ${sha256(fileBytes)}")
+        println("Complete: $complete")
     } catch (e: IOException) {
         println("Error: Could not connect to server — ${e.message}")
     } catch (e: Exception) {
@@ -18,79 +19,101 @@ fun main() {
     }
 }
 
-fun downloadFullFile(url: URL): ByteArray {
-    val initialConn = try {
-        url.openConnection() as HttpURLConnection
-    } catch (e: IOException) {
-        throw IOException("Failed to open connection to $url", e)
-    }
-
-    initialConn.requestMethod = "GET"
-    val declaredSize = initialConn.getHeaderField("Content-Length")?.toIntOrNull()
-    println("Declared total size: ${declaredSize ?: "unknown"}")
-
-    val firstChunk = try {
-        initialConn.inputStream.readAllBytes()
-    } catch (e: IOException) {
-        throw IOException("Failed to read initial chunk from $url", e)
-    } finally {
-        initialConn.disconnect()
-    }
-
+/**
+ * Downloads an entire file from a potentially unreliable HTTP server using range requests.
+ * Performs integrity checks using Content-Length when available.
+ *
+ * @param url The target URL to download the file from.
+ *
+ * @return A pair:
+ *   - First: Full byte array of the downloaded file.
+ *   - Second: Boolean indicating whether the download is believed to be complete.
+ *
+ * @param requestRetries Number of retry attempts for each HTTP request in case of failure.
+ *
+ * @throws IOException If repeated download attempts fail due to I/O errors.
+ */
+fun downloadFullFile(url: URL, requestRetries: Int = 3): Pair<ByteArray, Boolean> {
     val buffer = ByteArrayOutputStream()
+
+    // First request to get the initial chunk and determine total size from Content-Length
+    val (firstChunk, contentLength) = downloadRange(url, 0, null, maxRetries = requestRetries)
+    val declaredSize = contentLength?.let { firstChunk.size + it }
     buffer.write(firstChunk)
     var downloaded = firstChunk.size
 
-    var useDeclaredSize = declaredSize != null
-
     while (true) {
-        if (useDeclaredSize && downloaded >= declaredSize!!) {
-            val verifyPart = downloadRange(url, downloaded, declaredSize)
-            if (verifyPart.isEmpty()) {
-                println("Verified: no more data beyond declared size ($declaredSize bytes).")
-                break
-            } else {
-                println("Warning: received unexpected ${verifyPart.size} extra bytes — ignoring declared size.")
-                buffer.write(verifyPart)
-                downloaded += verifyPart.size
-                useDeclaredSize = false // switch to open-ended mode
-                continue
-            }
+        val (part, remaining) = downloadRange(url, downloaded, declaredSize, maxRetries = requestRetries)
+
+        if (part.isNotEmpty()) {
+            buffer.write(part)
+            downloaded += part.size
         }
 
-        val part = downloadRange(url, downloaded, declaredSize)
-        buffer.write(part)
+        // If we know the declared size, the server says no more data is available, and we downloaded exactly what was expected
+        if (declaredSize != null && remaining != null && remaining == 0 && downloaded == declaredSize) {
+            println("Download complete: received all $declaredSize bytes.")
+            return buffer.toByteArray() to true
+        }
+
+        // Otherwise download while we can
         if (part.isEmpty()) {
             if (declaredSize != null && downloaded < declaredSize) {
                 println("Warning: received 0 bytes at offset $downloaded, but expected $declaredSize — possible incomplete file!")
+                return buffer.toByteArray() to false
             } else {
                 println("Received 0 bytes at offset $downloaded — assuming end of file")
+                break
             }
-            break
         }
-        downloaded += part.size
     }
 
-    return buffer.toByteArray()
+    return buffer.toByteArray() to (declaredSize == null)
 }
 
-fun downloadRange(url: URL, start: Int, declaredSize: Int?): ByteArray {
-    return try {
-        val conn = url.openConnection() as HttpURLConnection
-        conn.setRequestProperty("Range", "bytes=$start-")
-        conn.requestMethod = "GET"
-        val bytes = conn.inputStream.readAllBytes()
-        if (bytes.isEmpty()) {
-            // warning handled in caller
-        } else {
+/**
+ * Attempts to download a range of bytes from the given URL, retrying up to [maxRetries] times on failure.
+ *
+ * @param url The target URL to download from.
+ * @param start The byte offset to start downloading from.
+ * @param declaredSize The expected total size of the file, if known.
+ * @param maxRetries Maximum number of retries in case of I/O failures.
+ *
+ * @return A pair:
+ *   - First: Byte array with downloaded data.
+ *   - Second: Estimated number of bytes remaining according to Content-Length (maybe null).
+ *
+ * @throws IOException If all retry attempts fail due to I/O error.
+ */
+fun downloadRange(url: URL, start: Int, declaredSize: Int?, maxRetries: Int = 3): Pair<ByteArray, Int?> {
+    var lastError: IOException? = null
+    repeat(maxRetries) { attempt ->
+        try {
+            val conn = url.openConnection() as HttpURLConnection
+            if (start > 0) {
+                conn.setRequestProperty("Range", "bytes=$start-")
+            }
+            conn.requestMethod = "GET"
+
+            val contentLength = conn.getHeaderField("Content-Length")?.toIntOrNull()
+            val bytes = conn.inputStream.readAllBytes()
+
+            val totalSize = if (start == 0) contentLength else declaredSize
             val newTotal = start + bytes.size
-            println("Received ${bytes.size} bytes (${declaredSize?.let { "$newTotal/$it" } ?: "$newTotal/?"})" +
-                    declaredSize?.let { " (${100 * newTotal / it}%)" }.orEmpty())
+
+            if (bytes.isNotEmpty()) {
+                println("Received ${bytes.size} bytes (${totalSize?.let { "$newTotal/$it" } ?: "$newTotal/?"})" +
+                        totalSize?.let { " (${100 * newTotal / it}%)" }.orEmpty())
+            }
+
+            val fileRemained = contentLength?.minus(bytes.size)
+            return bytes to fileRemained
+        } catch (e: IOException) {
+            lastError = e
+            println("Retry ${attempt + 1}/$maxRetries failed at offset $start: ${e.message}")
         }
-        bytes
-    } catch (e: IOException) {
-        throw IOException("Failed to download range starting at byte $start", e)
     }
+    throw IOException("Failed to download at offset $start after $maxRetries attempts", lastError!!)
 }
 
 // Computes SHA-256 hash as a hex string
